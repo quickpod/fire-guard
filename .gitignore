@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+packaging/dist/
+packaging/staging/
+*.spec
+.env
+.env.*
+scratch/
+*.tmp
+*.exe
+/out/

@@ -1,0 +1,5 @@
+# FireGuard runtime deps — permissive/weak-copyleft only, no AGPL/proprietary.
+# The firewall engine wraps the system `ufw` binary (no Python dependency).
+# Aura design system (vendored fireguard/aura.py) — CustomTkinter theme layer.
+customtkinter>=5.2,<7
+darkdetect>=0.8

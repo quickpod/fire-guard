@@ -1,0 +1,43 @@
+name: build-linux
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-tk
+          python -m pip install --upgrade pip -r requirements.txt pyinstaller pytest
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build FireGuard
+        run: >
+          pyinstaller --onefile --name FireGuard
+          --hidden-import fireguard.__main__
+          --add-data "fire-guard.png:."
+          --collect-all customtkinter
+          fire_guard_app.py
+      - name: Stage tarball
+        run: |
+          VER="$(python -c 'import fireguard; print(fireguard.__version__)')"
+          STAGE="packaging/staging/FireGuard-$VER-linux-x86_64"
+          mkdir -p "$STAGE" packaging/dist
+          cp dist/FireGuard "$STAGE/"
+          cp fire-guard.png LICENSE README.md "$STAGE/"
+          cp packaging/quickopen-fire-guard.desktop "$STAGE/"
+          cp packaging/install.sh "$STAGE/"
+          cp quickopen-root.crt "$STAGE/" 2>/dev/null || true
+          tar -C packaging/staging -czf "packaging/dist/FireGuard-$VER-linux-x86_64.tar.gz" "FireGuard-$VER-linux-x86_64"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fire-guard-linux
+          path: packaging/dist/FireGuard-*-linux-x86_64.tar.gz
+          if-no-files-found: error

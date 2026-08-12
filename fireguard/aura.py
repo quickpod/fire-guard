@@ -1,0 +1,1279 @@
+#!/usr/bin/env python3
+r"""Aura — the QuickOpen OS design system for tkinter desktop apps.
+
+Aura is a THEME + LAYOUT layer on top of CustomTkinter (MIT) that makes every
+QuickOpen desktop app look like a native sibling of quickopen.ai: the same
+deep blue-black canvas, the same accent-blue family, the same pill/chip and
+hairline-border language.  Identity: **"deep space + light"** — calm dark
+layers, one vivid per-app accent, a signature 2px "accent beam" gradient under
+the header and a 3x18 accent bar on the active sidebar pill.
+
+Dependencies (add to each app's requirements.txt):
+    customtkinter>=5.2   # pulls darkdetect + packaging, all MIT/permissive
+PyInstaller builds additionally need:  --collect-all customtkinter
+(the package ships .json theme assets that PyInstaller misses otherwise).
+
+Quick start — full scaffold::
+
+    import aura                                   # vendored as <pkg>/aura.py
+    app = aura.AuraApp(title="FindAll — by QuickOpen", app_name="FindAll",
+                       accent="#5b86f7", theme=guiconfig.get_theme(),
+                       icon_png=asset_path("find-all.png"), version="1.0.0",
+                       on_theme_change=guiconfig.set_theme)
+    app.add_section("search",  "Search",  "⌕", build_search_panel)
+    app.add_section("sources", "Sources", "☰", build_sources_panel)
+    app.show("search")
+    app.set_status("Ready")          # .set_error(msg) / .set_success(msg)
+    app.mainloop()
+
+Each ``builder(frame)`` receives a transparent content frame; populate it with
+Aura components: ``AuraButton`` (kind="primary"|"secondary"|"ghost"|"danger"),
+``AuraEntry`` / ``AuraCombo`` / ``AuraOption``, ``Switch``, ``SegmentedControl``,
+``Card`` (use ``card.body``), ``ProgressBar``, ``Tooltip(widget, text)``,
+``SectionLabel`` / ``Heading`` / ``Caption``, ``AuraScrollbar``.
+
+Modernizing a plain ttk app WITHOUT the scaffold::
+
+    root = tk.Tk()
+    aura.apply(root, accent="#22c8a3", theme="dark")   # restyles all ttk + tk
+
+``apply()`` must be called BEFORE creating any CustomTkinter widget (it loads
+the color theme); ``AuraApp`` does this for you.  ``aura.track(widget, role)``
+registers raw tk widgets (roles: "listbox", "text", "canvas") for re-theming
+when the theme flips.  ttk.Treeview / ttk.Notebook keep working and are
+restyled to blend (row height 30, accent-soft selection, pill-ish tabs).
+
+Everything is guarded to be harmless on Linux/Xvfb; Windows gets DWM polish
+(dark title bar, rounded corners, Mica attempt) automatically.
+"""
+
+from __future__ import annotations
+
+import colorsys
+import json
+import os
+import sys
+import tempfile
+
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import ttk
+import tkinter.font as tkfont
+
+__all__ = [
+    "TOKENS", "apply", "font", "spaced", "track", "style_ttk",
+    "windows_polish", "AuraApp", "AuraButton", "AuraEntry", "AuraCombo",
+    "AuraOption", "AuraTextbox", "AuraScrollbar", "Switch", "SegmentedControl",
+    "Card", "ProgressBar", "StatusBar", "Tooltip", "SectionLabel", "Heading",
+    "Caption",
+]
+
+# =========================================================================
+# 1. Design tokens  (mirrors frontend/src/styles.css)
+# =========================================================================
+
+TOKENS = {
+    "dark": {
+        "bg": "#0f1115", "bg2": "#14171c", "surface": "#1a1e24",
+        "surface2": "#222731", "surface3": "#2a3039",
+        "border": "#2b313b", "border2": "#3a424f",
+        "text": "#f1f3f7", "muted": "#9aa4b2", "faint": "#6f7a89",
+        "field": "#14171c",
+        "ok": "#37c56f", "warn": "#f0b429", "danger": "#e5484d",
+    },
+    "light": {
+        "bg": "#f5f7fa", "bg2": "#eef1f6", "surface": "#ffffff",
+        "surface2": "#f3f5f9", "surface3": "#e8ecf3",
+        "border": "#e0e5ec", "border2": "#c8d0dc",
+        "text": "#141820", "muted": "#5c6675", "faint": "#808b9b",
+        "field": "#ffffff",
+        "ok": "#17914b", "warn": "#b0700a", "danger": "#cf2d3a",
+    },
+    "geometry": {
+        "radius_card": 12, "radius_button": 10, "radius_input": 8,
+        "sidebar_w": 248, "header_h": 70, "pad": 24, "button_h": 38,
+        "row_h": 34,
+    },
+    "type": {
+        "title": 19, "heading": 15, "body": 12, "caption": 11, "section": 11,
+    },
+}
+
+DEFAULT_ACCENT = "#5b86f7"          # QuickOpen blue (dark-mode value)
+
+# module state, filled in by apply()
+_pal = {"light": None, "dark": None}     # per-mode resolved palettes
+_theme = "dark"
+_accent = DEFAULT_ACCENT
+_tracked = []                            # (widget, role) raw-tk registry
+_font_cache = {}
+
+
+# =========================================================================
+# 2. Color helpers
+# =========================================================================
+
+def _rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def mix(a, b, t):
+    """Blend color *a* toward *b* by fraction ``t`` (0..1)."""
+    ra, rb = _rgb(a), _rgb(b)
+    return _hex(tuple(ra[i] + (rb[i] - ra[i]) * t for i in range(3)))
+
+
+def _luma(c):
+    r, g, b = (v / 255.0 for v in _rgb(c))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _light_variant(accent):
+    """Derive a light-theme accent (darker, saturated) from a dark-mode one."""
+    if accent.lower() == DEFAULT_ACCENT:
+        return "#2f5fe0"                # exact quickopen.ai light primary
+    r, g, b = (v / 255.0 for v in _rgb(accent))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = min(l, 0.46)
+    s = min(0.92, s * 1.05)
+    return _hex(tuple(v * 255 for v in colorsys.hls_to_rgb(h, l, s)))
+
+
+def _resolve(accent):
+    """Fill _pal with both per-mode palettes for *accent*."""
+    la, da = _light_variant(accent), accent
+    for mode, ac in (("light", la), ("dark", da)):
+        t = dict(TOKENS[mode])
+        t["accent"] = ac
+        if mode == "dark":
+            t["accent_hover"] = mix(ac, "#ffffff", 0.12)
+            t["accent_active"] = mix(ac, "#000000", 0.14)
+            t["accent_soft"] = mix(t["surface"], ac, 0.18)
+            t["on_accent"] = "#0c1220" if _luma(ac) > 0.42 else "#ffffff"
+            t["ring"] = mix(ac, "#ffffff", 0.55)
+        else:
+            t["accent_hover"] = mix(ac, "#000000", 0.12)
+            t["accent_active"] = mix(ac, "#000000", 0.24)
+            t["accent_soft"] = mix("#ffffff", ac, 0.12)
+            t["on_accent"] = "#141820" if _luma(ac) > 0.62 else "#ffffff"
+            t["ring"] = mix(ac, "#000000", 0.25)
+        base = t["surface"]
+        t["ok_soft"] = mix(base, t["ok"], 0.16)
+        t["warn_soft"] = mix(base, t["warn"], 0.16)
+        t["danger_soft"] = mix(base, t["danger"], 0.14)
+        _pal[mode] = t
+    return _pal
+
+
+def _pair(key):
+    """(light, dark) tuple for a palette key — CustomTkinter auto-switches."""
+    return (_pal["light"][key], _pal["dark"][key])
+
+
+def P(key=None):
+    """Current-theme palette (or one value)."""
+    pal = _pal[_theme] or _resolve(_accent)[_theme]
+    return pal[key] if key else pal
+
+
+# =========================================================================
+# 3. Typography
+# =========================================================================
+
+def _family():
+    """Best available UI family. Cached after the first root exists."""
+    if "family" in _font_cache:
+        return _font_cache["family"]
+    fam = "DejaVu Sans"
+    if os.name == "nt":
+        fam = "Segoe UI"
+        try:
+            if "Segoe UI Variable Display" in tkfont.families():
+                fam = "Segoe UI Variable Display"
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        fam = "Helvetica Neue"
+    else:
+        try:
+            fams = tkfont.families()
+            if "DejaVu Sans" not in fams:
+                fam = "TkDefaultFont"
+        except Exception:
+            pass
+    _font_cache["family"] = fam
+    return fam
+
+
+def font(size=None, weight="normal", role=None):
+    """A CTkFont in the Aura family.  ``role`` picks a size from TOKENS."""
+    if role:
+        size = TOKENS["type"][role]
+        if role in ("title", "heading", "section"):
+            weight = "bold"
+    size = size or TOKENS["type"]["body"]
+    key = (size, weight)
+    f = _font_cache.get(key)
+    if f is None:
+        f = ctk.CTkFont(family=_family(), size=size, weight=weight)
+        _font_cache[key] = f
+    return f
+
+
+def spaced(text):
+    """Uppercase + letter-spaced (hair spaces) — Aura section-label styling."""
+    return " ".join(text.upper())
+
+
+# =========================================================================
+# 4. The CustomTkinter color theme  (generated per accent, then loaded)
+# =========================================================================
+
+def _ctk_theme():
+    return {
+        "CTk": {"fg_color": _pair("bg")},
+        "CTkToplevel": {"fg_color": _pair("bg")},
+        "CTkFrame": {
+            "corner_radius": 12, "border_width": 0,
+            "fg_color": _pair("surface"),
+            "top_fg_color": _pair("surface2"),
+            "border_color": _pair("border"),
+        },
+        "CTkButton": {
+            "corner_radius": 10, "border_width": 0,
+            "fg_color": _pair("accent"), "hover_color": _pair("accent_hover"),
+            "border_color": _pair("border"),
+            "text_color": _pair("on_accent"),
+            "text_color_disabled": _pair("faint"),
+        },
+        "CTkLabel": {"corner_radius": 0, "border_width": 0,
+                     "fg_color": "transparent", "border_color": _pair("border"),
+                     "text_color": _pair("text")},
+        "CTkEntry": {
+            "corner_radius": 8, "border_width": 1,
+            "fg_color": _pair("field"), "border_color": _pair("border"),
+            "text_color": _pair("text"),
+            "placeholder_text_color": _pair("faint"),
+        },
+        "CTkCheckBox": {
+            "corner_radius": 6, "border_width": 2,
+            "fg_color": _pair("accent"), "border_color": _pair("border2"),
+            "hover_color": _pair("accent_hover"),
+            "checkmark_color": _pair("on_accent"),
+            "text_color": _pair("text"), "text_color_disabled": _pair("faint"),
+        },
+        "CTkSwitch": {
+            "corner_radius": 1000, "border_width": 3, "button_length": 0,
+            "fg_color": ("#cdd5e0", _pal["dark"]["surface3"]),
+            "progress_color": _pair("accent"),
+            "button_color": ("#ffffff", "#f1f3f7"),
+            "button_hover_color": ("#ffffff", "#ffffff"),
+            "text_color": _pair("text"), "text_color_disabled": _pair("faint"),
+        },
+        "CTkRadioButton": {
+            "corner_radius": 1000, "border_width_checked": 5,
+            "border_width_unchecked": 2,
+            "fg_color": _pair("accent"), "border_color": _pair("border2"),
+            "hover_color": _pair("accent_hover"),
+            "text_color": _pair("text"), "text_color_disabled": _pair("faint"),
+        },
+        "CTkProgressBar": {
+            "corner_radius": 1000, "border_width": 0,
+            "fg_color": _pair("surface3"), "progress_color": _pair("accent"),
+            "border_color": _pair("border"),
+        },
+        "CTkSlider": {
+            "corner_radius": 1000, "button_corner_radius": 1000,
+            "border_width": 5, "button_length": 0,
+            "fg_color": _pair("surface3"),
+            "progress_color": _pair("accent"),
+            "button_color": _pair("accent"),
+            "button_hover_color": _pair("accent_hover"),
+        },
+        "CTkOptionMenu": {
+            "corner_radius": 8,
+            "fg_color": _pair("surface2"), "button_color": _pair("surface3"),
+            "button_hover_color": _pair("border2"),
+            "text_color": _pair("text"), "text_color_disabled": _pair("faint"),
+        },
+        "CTkComboBox": {
+            "corner_radius": 8, "border_width": 1,
+            "fg_color": _pair("field"), "border_color": _pair("border"),
+            "button_color": _pair("surface3"),
+            "button_hover_color": _pair("border2"),
+            "text_color": _pair("text"), "text_color_disabled": _pair("faint"),
+        },
+        "CTkScrollbar": {
+            "corner_radius": 1000, "border_spacing": 2,
+            "fg_color": "transparent",
+            "button_color": (_pal["light"]["border2"], _pal["dark"]["surface3"]),
+            "button_hover_color": (_pal["light"]["faint"], _pal["dark"]["border2"]),
+        },
+        "CTkSegmentedButton": {
+            "corner_radius": 10, "border_width": 3,
+            "fg_color": _pair("surface3"),
+            "selected_color": (mix("#ffffff", _pal["light"]["accent"], 0.20),
+                               mix(_pal["dark"]["surface"],
+                                   _pal["dark"]["accent"], 0.32)),
+            "selected_hover_color": (mix("#ffffff", _pal["light"]["accent"], 0.20),
+                                     mix(_pal["dark"]["surface"],
+                                         _pal["dark"]["accent"], 0.32)),
+            "unselected_color": _pair("surface3"),
+            "unselected_hover_color": (_pal["light"]["border"], _pal["dark"]["border"]),
+            "text_color": _pair("text"), "text_color_disabled": _pair("faint"),
+        },
+        "CTkTextbox": {
+            "corner_radius": 8, "border_width": 1,
+            "fg_color": _pair("field"), "border_color": _pair("border"),
+            "text_color": _pair("text"),
+            "scrollbar_button_color": (_pal["light"]["border2"], _pal["dark"]["surface3"]),
+            "scrollbar_button_hover_color": (_pal["light"]["faint"], _pal["dark"]["border2"]),
+        },
+        "CTkScrollableFrame": {"label_fg_color": _pair("surface2")},
+        "DropdownMenu": {
+            "fg_color": (_pal["light"]["surface"], _pal["dark"]["surface2"]),
+            "hover_color": (_pal["light"]["surface2"], _pal["dark"]["surface3"]),
+            "text_color": _pair("text"),
+        },
+        "CTkFont": {
+            "macOS": {"family": "Helvetica Neue", "size": 10, "weight": "normal"},
+            "Windows": {"family": "Segoe UI", "size": 10, "weight": "normal"},
+            "Linux": {"family": "DejaVu Sans", "size": 10, "weight": "normal"},
+        },
+    }
+
+
+def _load_ctk_theme():
+    """Merge our theme over ctk's bundled 'blue' (guarantees completeness)."""
+    base = {}
+    try:
+        blue = os.path.join(os.path.dirname(ctk.__file__),
+                            "assets", "themes", "blue.json")
+        with open(blue, "r", encoding="utf-8") as fh:
+            base = json.load(fh)
+    except Exception:
+        pass
+    ours = _ctk_theme()
+    for k, v in ours.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            base[k].update(v)
+        else:
+            base[k] = v
+    path = os.path.join(tempfile.gettempdir(),
+                        "aura_theme_%s_%d.json" % (_accent.lstrip("#"), os.getpid()))
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(base, fh)
+        ctk.set_default_color_theme(path)
+    except Exception:
+        pass
+
+
+# =========================================================================
+# 5. apply() — theme the world (ctk theme + ttk styles + tk option db)
+# =========================================================================
+
+def apply(root=None, accent=DEFAULT_ACCENT, theme="dark"):
+    """Activate Aura.  Call once BEFORE creating CustomTkinter widgets.
+
+    With ``root`` given, additionally restyles every ttk widget class, the tk
+    option database (Listbox/Text/Menu defaults), the window background and —
+    on Windows — the title bar / corners.  This alone modernizes a plain ttk
+    app.  Returns the active palette dict.
+    """
+    global _theme, _accent
+    _accent = accent
+    _theme = theme if theme in ("light", "dark") else "dark"
+    _resolve(accent)
+    _load_ctk_theme()
+    try:
+        ctk.set_appearance_mode(_theme)
+    except Exception:
+        pass
+    if root is not None:
+        style_ttk(root, _theme)
+        windows_polish(root, _theme)
+    return P()
+
+
+def track(widget, role):
+    """Register a raw tk widget ("listbox" | "text" | "canvas") for theming."""
+    _tracked.append((widget, role))
+    _recolor_tracked()
+
+
+def _recolor_tracked():
+    p = P()
+    for widget, role in list(_tracked):
+        try:
+            if not widget.winfo_exists():
+                _tracked.remove((widget, role))
+                continue
+            if role == "listbox":
+                widget.configure(bg=p["surface"], fg=p["text"],
+                                 selectbackground=p["accent_soft"],
+                                 selectforeground=p["text"],
+                                 highlightthickness=0, borderwidth=0,
+                                 activestyle="none")
+            elif role == "text":
+                widget.configure(bg=p["field"], fg=p["text"],
+                                 insertbackground=p["text"],
+                                 selectbackground=p["accent_soft"],
+                                 selectforeground=p["text"],
+                                 highlightthickness=0, borderwidth=0)
+            elif role == "canvas":
+                widget.configure(bg=p["surface"], highlightthickness=0)
+            elif role == "menu":
+                style_menu(widget)
+        except Exception:
+            pass
+
+
+def style_menu(menu):
+    """Recursively theme a tk.Menu (dropdowns honor colors; the native
+    menubar strip does not — which is why AuraApp never installs one)."""
+    p = P()
+    try:
+        menu.configure(bg=p["surface"], fg=p["text"],
+                       activebackground=p["accent_soft"],
+                       activeforeground=p["text"],
+                       disabledforeground=p["faint"],
+                       borderwidth=0, relief="flat", tearoff=0)
+        end = menu.index("end")
+        if end is not None:
+            for i in range(end + 1):
+                if menu.type(i) == "cascade":
+                    sub = menu.nametowidget(menu.entrycget(i, "menu"))
+                    style_menu(sub)
+    except Exception:
+        pass
+
+
+def style_ttk(root, theme=None):
+    """Restyle every ttk class + tk option DB to the Aura palette."""
+    global _theme
+    if theme:
+        _theme = theme
+    p = P()
+    fam = _family()
+    try:
+        root.configure(bg=p["bg"])
+    except Exception:
+        pass
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    body = (fam, TOKENS["type"]["body"])
+    style.configure(".", background=p["bg"], foreground=p["text"],
+                    fieldbackground=p["field"], bordercolor=p["border"],
+                    lightcolor=p["surface"], darkcolor=p["surface"],
+                    troughcolor=p["surface3"], focuscolor=p["accent"],
+                    selectbackground=p["accent_soft"],
+                    selectforeground=p["text"], font=body)
+    style.configure("TFrame", background=p["bg"])
+    style.configure("Surface.TFrame", background=p["surface"])
+    style.configure("TLabel", background=p["bg"], foreground=p["text"])
+    style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
+    style.configure("Heading.TLabel", background=p["bg"], foreground=p["text"],
+                    font=(fam, TOKENS["type"]["heading"], "bold"))
+    style.configure("Section.TLabel", background=p["bg"],
+                    foreground=p["muted"],
+                    font=(fam, TOKENS["type"]["section"], "bold"))
+    style.configure("TButton", background=p["surface2"], foreground=p["text"],
+                    bordercolor=p["border"], focuscolor=p["accent"],
+                    padding=(12, 6), relief="flat")
+    style.map("TButton",
+              background=[("pressed", p["surface3"]), ("active", p["surface3"]),
+                          ("disabled", p["bg2"])],
+              foreground=[("disabled", p["faint"])])
+    style.configure("Accent.TButton", background=p["accent"],
+                    foreground=p["on_accent"], bordercolor=p["accent"],
+                    padding=(14, 6))
+    style.map("Accent.TButton",
+              background=[("pressed", p["accent_active"]),
+                          ("active", p["accent_hover"]),
+                          ("disabled", p["surface3"])],
+              foreground=[("disabled", p["faint"])])
+    for name in ("TEntry", "TSpinbox", "TCombobox"):
+        style.configure(name, fieldbackground=p["field"], foreground=p["text"],
+                        insertcolor=p["text"], bordercolor=p["border"],
+                        lightcolor=p["field"], darkcolor=p["field"],
+                        arrowcolor=p["muted"], padding=6)
+        style.map(name, bordercolor=[("focus", p["accent"])],
+                  lightcolor=[("focus", p["accent"])],
+                  darkcolor=[("focus", p["accent"])],
+                  fieldbackground=[("readonly", p["field"]),
+                                   ("disabled", p["bg2"])],
+                  foreground=[("readonly", p["text"])])
+    style.configure("TCheckbutton", background=p["bg"], foreground=p["text"],
+                    indicatorcolor=p["field"], focuscolor=p["accent"])
+    style.map("TCheckbutton", background=[("active", p["bg"])],
+              indicatorcolor=[("selected", p["accent"])])
+    style.configure("TRadiobutton", background=p["bg"], foreground=p["text"],
+                    indicatorcolor=p["field"], focuscolor=p["accent"])
+    style.map("TRadiobutton", background=[("active", p["bg"])],
+              indicatorcolor=[("selected", p["accent"])])
+    style.configure("TLabelframe", background=p["bg"], foreground=p["text"],
+                    bordercolor=p["border"], relief="solid")
+    style.configure("TLabelframe.Label", background=p["bg"],
+                    foreground=p["muted"],
+                    font=(fam, TOKENS["type"]["section"], "bold"))
+    # Treeview: row height 30, no borders, accent-soft selection
+    style.configure("Treeview", background=p["surface"],
+                    fieldbackground=p["surface"], foreground=p["text"],
+                    bordercolor=p["surface"], borderwidth=0, relief="flat",
+                    rowheight=TOKENS["geometry"]["row_h"], font=body)
+    style.map("Treeview",
+              background=[("selected", p["accent_soft"])],
+              foreground=[("selected", p["text"])])
+    style.configure("Treeview.Heading", background=p["surface"],
+                    foreground=p["muted"], bordercolor=p["surface"],
+                    borderwidth=0, relief="flat", padding=(8, 6),
+                    font=(fam, TOKENS["type"]["section"], "bold"))
+    style.map("Treeview.Heading", background=[("active", p["surface"])])
+    # slim flat scrollbars, no arrows
+    for orient, seq in (("Vertical", "ns"), ("Horizontal", "ew")):
+        sb = "%s.TScrollbar" % orient
+        try:
+            style.layout(sb, [
+                ("%s.Scrollbar.trough" % orient, {"sticky": seq, "children": [
+                    ("%s.Scrollbar.thumb" % orient,
+                     {"expand": "1", "sticky": "nswe"})]})])
+        except Exception:
+            pass
+        style.configure(sb, background=p["surface3"], troughcolor=p["surface"],
+                        bordercolor=p["surface"], lightcolor=p["surface3"],
+                        darkcolor=p["surface3"], arrowsize=8, gripcount=0,
+                        relief="flat", width=8)
+        style.map(sb, background=[("active", p["border2"])])
+    # Notebook: flat pill-ish tabs (kill clam's bright tab borders + focus dots)
+    try:
+        style.layout("TNotebook.Tab", [
+            ("Notebook.tab", {"sticky": "nswe", "children": [
+                ("Notebook.padding", {"side": "top", "sticky": "nswe",
+                                      "children": [
+                    ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+    except Exception:
+        pass
+    style.configure("TNotebook", background=p["bg"], borderwidth=0,
+                    bordercolor=p["border"], lightcolor=p["surface"],
+                    darkcolor=p["surface"], tabmargins=(0, 0, 0, 8))
+    style.configure("TNotebook.Tab", background=p["bg"], foreground=p["muted"],
+                    bordercolor=p["bg"], lightcolor=p["bg"], darkcolor=p["bg"],
+                    padding=(14, 7), borderwidth=1, font=body)
+    style.map("TNotebook.Tab",
+              background=[("selected", p["accent_soft"]), ("active", p["surface2"])],
+              bordercolor=[("selected", p["accent_soft"])],
+              lightcolor=[("selected", p["accent_soft"])],
+              darkcolor=[("selected", p["accent_soft"])],
+              foreground=[("selected", p["text"])])
+    style.configure("Horizontal.TProgressbar", background=p["accent"],
+                    troughcolor=p["surface3"], bordercolor=p["surface3"],
+                    lightcolor=p["accent"], darkcolor=p["accent"],
+                    borderwidth=0, thickness=4)
+    style.configure("TScale", background=p["bg"], troughcolor=p["surface3"])
+    style.configure("TSeparator", background=p["border"])
+    style.configure("TPanedwindow", background=p["bg"])
+    # tk option database (only affects widgets created afterwards)
+    try:
+        root.option_add("*Listbox.background", p["surface"])
+        root.option_add("*Listbox.foreground", p["text"])
+        root.option_add("*Listbox.selectBackground", p["accent_soft"])
+        root.option_add("*Listbox.selectForeground", p["text"])
+        root.option_add("*Listbox.borderWidth", 0)
+        root.option_add("*Listbox.highlightThickness", 0)
+        root.option_add("*Listbox.activeStyle", "none")
+        root.option_add("*Text.background", p["field"])
+        root.option_add("*Text.foreground", p["text"])
+        root.option_add("*Text.insertBackground", p["text"])
+        root.option_add("*Text.borderWidth", 0)
+        root.option_add("*Text.highlightThickness", 0)
+        root.option_add("*Menu.background", p["surface2"])
+        root.option_add("*Menu.foreground", p["text"])
+        root.option_add("*Menu.activeBackground", p["surface3"])
+        root.option_add("*Menu.activeForeground", p["text"])
+        root.option_add("*Menu.activeBorderWidth", 0)
+        root.option_add("*Menu.borderWidth", 0)
+    except Exception:
+        pass
+    _recolor_tracked()
+
+
+def windows_polish(window, theme=None):
+    """Windows-only DWM niceties; harmless everywhere else."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        dwm = ctypes.windll.dwmapi
+        dark = ctypes.c_int(1 if (theme or _theme) == "dark" else 0)
+        dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark),
+                                  ctypes.sizeof(dark))       # immersive dark
+        pref = ctypes.c_int(2)
+        dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref),
+                                  ctypes.sizeof(pref))       # round corners
+        try:
+            mica = ctypes.c_int(2)
+            dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(mica),
+                                      ctypes.sizeof(mica))   # mica backdrop
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# =========================================================================
+# 6. Components — thin CustomTkinter wrappers with Aura geometry baked in
+# =========================================================================
+
+class AuraButton(ctk.CTkButton):
+    """Aura button.  kind: "primary" | "secondary" | "ghost" | "danger".
+
+    Keyboard-focusable (TAB) with a visible 2px accent focus ring; Enter and
+    Space activate it.  Also accepts a ttk-compatible ``state([...])`` call so
+    existing ``btn.state(["disabled"])`` code keeps working.
+    """
+
+    KINDS = {
+        "primary": {},
+        "secondary": dict(fg_color_key=("surface", "surface2"),
+                          hover_key=("surface2", "surface3"),
+                          text_key="text", border=1),
+        "ghost": dict(fg_color="transparent", hover_key="accent_soft",
+                      text_key="accent"),
+        "danger": {},
+    }
+
+    def __init__(self, master, text="", command=None, kind="primary", **kw):
+        self._kind = kind
+        kw.setdefault("height", TOKENS["geometry"]["button_h"])
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_button"])
+        kw.setdefault("font", font(role="body"))
+        if kind == "secondary":
+            kw.setdefault("fg_color", (_pal["light"]["surface"],
+                                       _pal["dark"]["surface2"]))
+            kw.setdefault("hover_color", (_pal["light"]["surface2"],
+                                          _pal["dark"]["surface3"]))
+            kw.setdefault("text_color", _pair("text"))
+            kw.setdefault("border_width", 1)
+            kw.setdefault("border_color", _pair("border2"))
+        elif kind == "ghost":
+            kw.setdefault("fg_color", "transparent")
+            kw.setdefault("hover_color", _pair("accent_soft"))
+            kw.setdefault("text_color", _pair("accent"))
+        elif kind == "danger":
+            kw.setdefault("fg_color", (_pal["light"]["danger"],
+                                       _pal["dark"]["danger"]))
+            kw.setdefault("hover_color",
+                          (mix(_pal["light"]["danger"], "#000000", 0.12),
+                           mix(_pal["dark"]["danger"], "#ffffff", 0.10)))
+            kw.setdefault("text_color", ("#ffffff", "#ffffff"))
+        # Disabled labels must stay legible on colored fills: blend white
+        # toward the fill for primary/danger, use muted on neutral kinds.
+        if kind in ("primary", "danger"):
+            fill = kw.get("fg_color") or _pair("accent")
+            kw.setdefault("text_color_disabled",
+                          (mix("#ffffff", fill[0], 0.35),
+                           mix("#ffffff", fill[1], 0.35)))
+        else:
+            kw.setdefault("text_color_disabled", _pair("muted"))
+        super().__init__(master, text=text, command=command, **kw)
+        self._aura_ring = _pair("ring") if kind == "primary" else _pair("accent")
+        self._aura_saved = (self.cget("border_width"), self.cget("border_color"))
+        try:
+            self._canvas.configure(takefocus=1)
+            self._canvas.bind("<FocusIn>", self._aura_focus_in)
+            self._canvas.bind("<FocusOut>", self._aura_focus_out)
+            for seq in ("<Return>", "<space>", "<KP_Enter>"):
+                self._canvas.bind(seq, self._aura_activate)
+        except Exception:
+            pass
+
+    def _aura_focus_in(self, _e=None):
+        self._aura_saved = (self.cget("border_width"), self.cget("border_color"))
+        try:
+            self.configure(border_width=2, border_color=self._aura_ring)
+        except Exception:
+            pass
+
+    def _aura_focus_out(self, _e=None):
+        try:
+            self.configure(border_width=self._aura_saved[0],
+                           border_color=self._aura_saved[1])
+        except Exception:
+            pass
+
+    def _aura_activate(self, _e=None):
+        if self.cget("state") != "disabled":
+            cmd = self._command
+            if cmd:
+                cmd()
+
+    def state(self, statespec=None):
+        """ttk-style state shim: state(["disabled"]) / state(["!disabled"])."""
+        if statespec:
+            if "disabled" in statespec:
+                self.configure(state="disabled")
+            if "!disabled" in statespec:
+                self.configure(state="normal")
+        return [] if self.cget("state") == "normal" else ["disabled"]
+
+
+class AuraEntry(ctk.CTkEntry):
+    """Rounded (8) hairline entry with a 2px accent focus ring + placeholder."""
+
+    def __init__(self, master, placeholder="", **kw):
+        kw.setdefault("height", TOKENS["geometry"]["button_h"])
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_input"])
+        kw.setdefault("font", font(role="body"))
+        if placeholder:
+            kw.setdefault("placeholder_text", placeholder)
+        super().__init__(master, **kw)
+        try:
+            self._entry.bind("<FocusIn>", self._aura_fin, add="+")
+            self._entry.bind("<FocusOut>", self._aura_fout, add="+")
+        except Exception:
+            pass
+
+    def _aura_fin(self, _e=None):
+        try:
+            self.configure(border_width=2, border_color=_pair("accent"))
+        except Exception:
+            pass
+
+    def _aura_fout(self, _e=None):
+        try:
+            self.configure(border_width=1, border_color=_pair("border"))
+        except Exception:
+            pass
+
+
+class AuraCombo(ctk.CTkComboBox):
+    def __init__(self, master, **kw):
+        kw.setdefault("height", TOKENS["geometry"]["button_h"])
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_input"])
+        kw.setdefault("font", font(role="body"))
+        kw.setdefault("dropdown_font", font(role="body"))
+        super().__init__(master, **kw)
+
+
+class AuraOption(ctk.CTkOptionMenu):
+    def __init__(self, master, **kw):
+        kw.setdefault("height", TOKENS["geometry"]["button_h"])
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_input"])
+        kw.setdefault("font", font(role="body"))
+        kw.setdefault("dropdown_font", font(role="body"))
+        super().__init__(master, **kw)
+
+
+class AuraTextbox(ctk.CTkTextbox):
+    def __init__(self, master, **kw):
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_input"])
+        kw.setdefault("border_width", 1)
+        kw.setdefault("font", font(role="body"))
+        super().__init__(master, **kw)
+
+
+class AuraScrollbar(ctk.CTkScrollbar):
+    """Flat 8px thumb, no arrows."""
+
+    def __init__(self, master, **kw):
+        kw.setdefault("width", 12)      # 12 incl. 2px spacing -> 8px thumb
+        super().__init__(master, **kw)
+
+
+class Switch(ctk.CTkSwitch):
+    """Accent toggle (CustomTkinter animates the slide)."""
+
+    def __init__(self, master, text="", **kw):
+        kw.setdefault("font", font(role="body"))
+        kw.setdefault("switch_width", 40)
+        kw.setdefault("switch_height", 20)
+        super().__init__(master, text=text, **kw)
+
+
+class SegmentedControl(ctk.CTkSegmentedButton):
+    """Pill segmented control (chip language from quickopen.ai)."""
+
+    def __init__(self, master, values=None, command=None, **kw):
+        kw.setdefault("height", 32)
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_button"])
+        kw.setdefault("font", font(role="body"))
+        kw.setdefault("dynamic_resizing", False)
+        super().__init__(master, values=values or [], command=command, **kw)
+
+
+class ProgressBar(ctk.CTkProgressBar):
+    """Slim 4px accent bar; ``mode="indeterminate"`` + start() for shimmer."""
+
+    def __init__(self, master, **kw):
+        kw.setdefault("height", 4)
+        kw.setdefault("corner_radius", 2)
+        super().__init__(master, **kw)
+        if kw.get("mode") != "indeterminate":
+            self.set(0)
+
+
+class Card(ctk.CTkFrame):
+    """Raised radius-12 surface with hairline border and optional title.
+
+    Put content in ``card.body`` (a transparent frame with padding applied).
+    """
+
+    def __init__(self, master, title=None, padding=16, **kw):
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_card"])
+        kw.setdefault("fg_color", _pair("surface"))
+        kw.setdefault("border_width", 1)
+        kw.setdefault("border_color", _pair("border"))
+        super().__init__(master, **kw)
+        pad = padding
+        if title:
+            SectionLabel(self, title).pack(anchor="w", padx=pad, pady=(pad, 2))
+        self.body = ctk.CTkFrame(self, fg_color="transparent")
+        self.body.pack(fill="both", expand=True, padx=pad,
+                       pady=(6 if title else pad, pad))
+
+
+class SectionLabel(ctk.CTkLabel):
+    """9pt bold UPPERCASE letter-spaced muted label."""
+
+    def __init__(self, master, text="", **kw):
+        kw.setdefault("font", font(role="section"))
+        kw.setdefault("text_color", _pair("muted"))
+        kw.setdefault("anchor", "w")
+        super().__init__(master, text=spaced(text), **kw)
+
+
+class Heading(ctk.CTkLabel):
+    """13pt semibold page/card heading."""
+
+    def __init__(self, master, text="", **kw):
+        kw.setdefault("font", font(role="heading"))
+        kw.setdefault("anchor", "w")
+        super().__init__(master, text=text, **kw)
+
+
+class Caption(ctk.CTkLabel):
+    """9pt muted caption."""
+
+    def __init__(self, master, text="", **kw):
+        kw.setdefault("font", font(role="caption"))
+        kw.setdefault("text_color", _pair("muted"))
+        kw.setdefault("anchor", "w")
+        super().__init__(master, text=text, **kw)
+
+
+class StatusBar(ctk.CTkFrame):
+    """Inline status / error / success area (replaces old error bars).
+
+    ``set_status(text)`` (muted), ``set_error(msg)`` (danger tint + icon),
+    ``set_success(msg)`` (green tint), ``set_working(msg)`` (accent),
+    ``clear()``.  ``bar.actions`` is a right-aligned frame for app buttons.
+    """
+
+    def __init__(self, master, **kw):
+        kw.setdefault("fg_color", "transparent")
+        kw.setdefault("corner_radius", 0)
+        super().__init__(master, **kw)
+        self.grid_columnconfigure(0, weight=1)
+        self._pill = ctk.CTkFrame(self, corner_radius=8, fg_color="transparent")
+        self._pill.grid(row=0, column=0, sticky="w")
+        self._label = ctk.CTkLabel(self._pill, text="", font=font(role="body"),
+                                   text_color=_pair("muted"), anchor="w")
+        self._label.pack(side="left", padx=10, pady=4)
+        # width/height 1: an EMPTY CTkFrame otherwise keeps its 200x200 default
+        self.actions = ctk.CTkFrame(self, fg_color="transparent",
+                                    width=1, height=1)
+        self.actions.grid(row=0, column=1, sticky="e")
+
+    def _show(self, icon, text, fg, text_color):
+        self._pill.configure(fg_color=fg)
+        self._label.configure(text=(icon + "  " + text) if icon else text,
+                              text_color=text_color)
+
+    def set_status(self, text, kind="idle"):
+        if kind == "err":
+            self.set_error(text)
+        elif kind == "ok":
+            self.set_success(text)
+        elif kind == "working":
+            self.set_working(text)
+        else:
+            self._show("", text, "transparent", _pair("muted"))
+
+    def set_error(self, text):
+        self._show("✕", text,
+                   (_pal["light"]["danger_soft"], _pal["dark"]["danger_soft"]),
+                   _pair("danger"))
+
+    def set_success(self, text):
+        self._show("✓", text,
+                   (_pal["light"]["ok_soft"], _pal["dark"]["ok_soft"]),
+                   _pair("ok"))
+
+    def set_working(self, text):
+        self._show("◌", text, "transparent", _pair("accent"))
+
+    def clear(self):
+        self._show("", "", "transparent", _pair("muted"))
+
+
+class Tooltip:
+    """Raised overlay tooltip after a 500ms hover delay."""
+
+    def __init__(self, widget, text, delay=500):
+        self.widget, self.text, self.delay = widget, text, delay
+        self._after, self._tip = None, None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        try:
+            self._after = self.widget.after(self.delay, self._show)
+        except Exception:
+            pass
+
+    def _cancel(self):
+        if self._after:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        if self._tip:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry("+%d+%d" % (x, y))
+            p = P()
+            tw.configure(bg=p["border"])
+            inner = tk.Frame(tw, bg=p["surface2"])
+            inner.pack(padx=1, pady=1)
+            tk.Label(inner, text=self.text, bg=p["surface2"], fg=p["text"],
+                     font=(_family(), TOKENS["type"]["caption"]),
+                     justify="left", padx=8, pady=4).pack()
+            tw.attributes("-topmost", True)
+            self._tip = tw
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+# =========================================================================
+# 7. AuraApp — window scaffold (sidebar + header + beam + content + status)
+# =========================================================================
+
+class _NavItem(ctk.CTkFrame):
+    """Sidebar pill: glyph + label, hover tint, active = accent-soft + bar."""
+
+    def __init__(self, master, label, glyph, command):
+        super().__init__(master, fg_color="transparent", corner_radius=0,
+                         height=36)
+        self.pack_propagate(False)
+        text = ("%s   %s" % (glyph, label)) if glyph else label
+        self.btn = ctk.CTkButton(
+            self, text=text, command=command, anchor="w",
+            height=36, corner_radius=TOKENS["geometry"]["radius_button"],
+            fg_color="transparent",
+            hover_color=(_pal["light"]["surface2"], _pal["dark"]["surface2"]),
+            text_color=_pair("muted"), font=font(role="body"))
+        self.btn.pack(fill="both", expand=True)
+        self.bar = ctk.CTkFrame(self, width=3, height=18, corner_radius=2,
+                                fg_color=_pair("accent"))
+
+    def set_active(self, active):
+        if active:
+            self.btn.configure(fg_color=_pair("accent_soft"),
+                               text_color=_pair("text"),
+                               hover_color=_pair("accent_soft"))
+            self.bar.place(x=1, rely=0.5, anchor="w")
+        else:
+            self.btn.configure(
+                fg_color="transparent", text_color=_pair("muted"),
+                hover_color=(_pal["light"]["surface2"], _pal["dark"]["surface2"]))
+            self.bar.place_forget()
+
+
+class AuraApp(ctk.CTk):
+    """The Aura window scaffold.
+
+    Layout: full-height sidebar (icon + app name, nav pills, theme toggle +
+    version) | header (page title + ``header_actions``) over the signature
+    accent beam | swappable content | status bar (``statusbar`` +
+    ``statusbar.actions``).
+
+    Use :meth:`add_section`, :meth:`show`, :meth:`set_status`,
+    :meth:`set_error`, :meth:`set_success`.  ``on_theme_change(theme)`` is the
+    persistence hook (e.g. ``guiconfig.set_theme``).
+    """
+
+    def __init__(self, title="Aura app", app_name=None, accent=DEFAULT_ACCENT,
+                 theme="dark", icon_png=None, version="", tagline=None,
+                 on_theme_change=None, size=(1100, 700), min_size=(900, 560)):
+        apply(None, accent=accent, theme=theme)      # before any ctk widget
+        super().__init__()
+        self.title(title)
+        self.geometry("%dx%d" % size)
+        self.minsize(*min_size)
+        self.accent = accent
+        self.theme = "dark" if theme not in ("light", "dark") else theme
+        self.on_theme_change = on_theme_change
+        self._sections = {}      # id -> dict(item, frame, builder, label, built)
+        self._order = []
+        self._active = None
+        self._img_refs = []
+
+        g = TOKENS["geometry"]
+        self.grid_columnconfigure(2, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        # ---- sidebar
+        self.sidebar = ctk.CTkFrame(self, width=g["sidebar_w"], corner_radius=0,
+                                    fg_color=_pair("surface"))
+        self.sidebar.grid(row=0, column=0, rowspan=4, sticky="nsw")
+        self.sidebar.grid_propagate(False)
+        self.sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar.grid_rowconfigure(2, weight=1)
+
+        hairline = ctk.CTkFrame(self, width=1, corner_radius=0,
+                                fg_color=_pair("border"))
+        hairline.grid(row=0, column=1, rowspan=4, sticky="ns")
+
+        brand = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="ew", padx=16, pady=(18, 14))
+        self._icon_label = None
+        if icon_png:
+            try:
+                img = tk.PhotoImage(file=icon_png)
+                k = max(1, round(img.width() / 24))
+                img = img.subsample(k, k)
+                self._img_refs.append(img)
+                self._icon_label = tk.Label(brand, image=img, bd=0,
+                                            bg=P("surface"))
+                self._icon_label.pack(side="left", padx=(0, 9))
+            except Exception:
+                self._icon_label = None
+        ctk.CTkLabel(brand, text=app_name or title, font=font(13, "bold"),
+                     anchor="w").pack(side="left", fill="x", expand=True)
+
+        self._nav = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self._nav.grid(row=1, column=0, sticky="new", padx=10)
+
+        foot = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        foot.grid(row=3, column=0, sticky="ew", padx=16, pady=14)
+        self._theme_switch = Switch(foot, text="Dark mode",
+                                    command=self._on_toggle_theme)
+        self._theme_switch.pack(anchor="w")
+        if self.theme == "dark":
+            self._theme_switch.select()
+        cap = "v%s" % version if version else ""
+        if tagline:
+            cap = tagline + ("   ·   " + cap if cap else "")
+        if cap:
+            Caption(foot, cap, text_color=_pair("faint")).pack(
+                anchor="w", pady=(8, 0))
+
+        # ---- header + beam
+        header = ctk.CTkFrame(self, height=g["header_h"], corner_radius=0,
+                              fg_color="transparent")
+        header.grid(row=0, column=2, sticky="ew")
+        header.grid_propagate(False)
+        header.grid_columnconfigure(0, weight=1)
+        self._title_label = ctk.CTkLabel(header, text="", anchor="w",
+                                         font=font(role="title"))
+        self._title_label.grid(row=0, column=0, sticky="w", padx=g["pad"],
+                               pady=(14, 12))
+        self.header_actions = ctk.CTkFrame(header, fg_color="transparent",
+                                           width=1, height=1)
+        self.header_actions.grid(row=0, column=1, sticky="e",
+                                 padx=(0, g["pad"]))
+
+        self._beam = tk.Canvas(self, height=2, highlightthickness=0, bd=0,
+                               bg=P("bg"))
+        self._beam.grid(row=1, column=2, sticky="ew")
+        self._beam_w = 0
+        self._beam.bind("<Configure>", self._draw_beam)
+
+        # ---- content host
+        self._content = ctk.CTkFrame(self, fg_color="transparent",
+                                     corner_radius=0)
+        self._content.grid(row=2, column=2, sticky="nsew",
+                           padx=g["pad"], pady=(18, 10))
+        self._content.grid_columnconfigure(0, weight=1)
+        self._content.grid_rowconfigure(0, weight=1)
+
+        # ---- status bar
+        self.statusbar = StatusBar(self)
+        self.statusbar.grid(row=3, column=2, sticky="ew",
+                            padx=g["pad"], pady=(0, 12))
+
+        style_ttk(self, self.theme)
+        windows_polish(self, self.theme)
+
+    # ---- sections -----------------------------------------------------
+    def add_section(self, sid, label, glyph="", builder=None):
+        """Register a sidebar section; ``builder(frame)`` runs on first show."""
+        item = _NavItem(self._nav, label, glyph, lambda s=sid: self.show(s))
+        item.pack(fill="x", pady=2)
+        frame = ctk.CTkFrame(self._content, fg_color="transparent",
+                             corner_radius=0)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.grid_remove()
+        self._sections[sid] = {"item": item, "frame": frame,
+                               "builder": builder, "label": label,
+                               "built": False}
+        self._order.append(sid)
+        return frame
+
+    def show(self, sid):
+        """Raise a section (lazily building it) and update the header title."""
+        sec = self._sections.get(sid)
+        if not sec:
+            return
+        if not sec["built"]:
+            sec["built"] = True
+            if sec["builder"]:
+                sec["builder"](sec["frame"])
+        for other_id, other in self._sections.items():
+            other["item"].set_active(other_id == sid)
+            if other_id != sid:
+                other["frame"].grid_remove()
+        sec["frame"].grid()
+        self._active = sid
+        self._title_label.configure(text=sec["label"])
+
+    @property
+    def active_section(self):
+        return self._active
+
+    # ---- status proxies ------------------------------------------------
+    def set_status(self, text, kind="idle"):
+        self.statusbar.set_status(text, kind)
+
+    def set_error(self, text):
+        self.statusbar.set_error(text)
+
+    def set_success(self, text):
+        self.statusbar.set_success(text)
+
+    # ---- theme ---------------------------------------------------------
+    def _on_toggle_theme(self):
+        self.set_theme("dark" if self._theme_switch.get() else "light")
+
+    def configure(self, cnf=None, **kw):
+        """Intercept ``config(menu=...)``: the native menubar strip is drawn
+        by the OS and stays light in dark mode, so Aura never installs one.
+        The menu becomes a styled dropdown behind a ☰ button in the header."""
+        menu = None
+        if isinstance(cnf, dict) and "menu" in cnf:
+            menu = cnf.pop("menu")
+        if "menu" in kw:
+            menu = kw.pop("menu")
+        if menu not in (None, ""):
+            self.attach_menu(menu)
+            if not kw and not cnf:
+                return None
+        return super().configure(cnf, **kw) if cnf else super().configure(**kw)
+
+    config = configure
+
+    def attach_menu(self, menu):
+        """Style *menu* and expose it via a ☰ header button (replaces the
+        native menubar)."""
+        self._aura_menu = menu
+        track(menu, "menu")
+        if getattr(self, "_menu_btn", None) is None:
+            self._menu_btn = AuraButton(self.header_actions, text="☰",
+                                        kind="ghost", width=40,
+                                        command=self._post_aura_menu)
+            self._menu_btn.pack(side="left", padx=(0, 6))
+
+    def _post_aura_menu(self):
+        m = getattr(self, "_aura_menu", None)
+        if m is None:
+            return
+        try:
+            style_menu(m)
+            x = self._menu_btn.winfo_rootx()
+            y = self._menu_btn.winfo_rooty() + self._menu_btn.winfo_height() + 4
+            m.tk_popup(x, y)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+
+    def set_theme(self, theme):
+        if theme not in ("light", "dark"):
+            return
+        self.theme = theme
+        global _theme
+        _theme = theme
+        try:
+            ctk.set_appearance_mode(theme)
+        except Exception:
+            pass
+        if self._theme_switch.get() != (1 if theme == "dark" else 0):
+            (self._theme_switch.select if theme == "dark"
+             else self._theme_switch.deselect)()
+        style_ttk(self, theme)
+        if self._icon_label is not None:
+            try:
+                self._icon_label.configure(bg=P("surface"))
+            except Exception:
+                pass
+        try:
+            self._beam.configure(bg=P("bg"))
+        except Exception:
+            pass
+        self._beam_w = 0
+        self._draw_beam()
+        windows_polish(self, theme)
+        if self.on_theme_change:
+            try:
+                self.on_theme_change(theme)
+            except Exception:
+                pass
+
+    # ---- the signature accent beam ------------------------------------
+    def _draw_beam(self, _e=None):
+        try:
+            w = self._beam.winfo_width()
+        except Exception:
+            return
+        if w <= 1 or w == self._beam_w:
+            return
+        self._beam_w = w
+        self._beam.delete("all")
+        p = P()
+        accent, bg = p["accent"], p["bg"]
+        fade_end = max(1, int(w * 0.85))
+        step = 3
+        for x in range(0, w, step):
+            t = min(1.0, x / fade_end)
+            self._beam.create_rectangle(x, 0, x + step, 2,
+                                        fill=mix(accent, bg, t), width=0)

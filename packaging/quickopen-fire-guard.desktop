@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FireGuard
+GenericName=Firewall Manager
+Comment=A simple, friendly GUI for the Linux ufw firewall
+Exec=/opt/quickopen/fire-guard/FireGuard
+Icon=quickopen-fire-guard
+Terminal=false
+Categories=System;Security;Settings;
+Keywords=firewall;ufw;security;rules;
+StartupNotify=true

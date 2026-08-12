@@ -1,0 +1,13 @@
+{
+  "slug": "fire-guard",
+  "name": "FireGuard",
+  "tagline": "A simple, friendly GUI for the Linux ufw firewall.",
+  "categorySlug": "security",
+  "license": "Apache-2.0",
+  "description": "See your firewall at a glance and manage it without the command line. FireGuard is a friendly front-end for the Linux Uncomplicated Firewall (ufw): view status and numbered rules, toggle the firewall, add or delete rules from a plain form (with one-click Allow SSH/HTTP/HTTPS presets), set default policies, and allow application profiles. Privileged changes are applied through pkexec — no terminal needed. Fully local; it only drives your own ufw.",
+  "aiStack": "Python (tkinter + CLI), ufw",
+  "platforms": [
+    "linux"
+  ],
+  "buildEntry": "fire_guard_app.py"
+}
