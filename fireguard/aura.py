@@ -442,6 +442,74 @@ def _load_ctk_theme():
 
 
 # =========================================================================
+# 4b. WM_CLASS — how a window manager finds a window's .desktop entry
+# =========================================================================
+#
+# Field defect E (Quick OS 0.1.3, 2026-08-14): 35 of 36 bundled apps reported
+# WM_CLASS "tk", "Tk" — tkinter's default, identical for every app. The
+# consequences were all invisible from inside the app:
+#
+#   * Plasma's Task Manager cannot map a window to its .desktop entry, so it
+#     never uses the themed Icon= key. It falls back to the single-size
+#     _NET_WM_ICON the app set and upscales it to panel height.
+#   * All 35 apps collapse into ONE taskbar group — literally
+#     indistinguishable to the window manager.
+#   * A pinned launcher never associates with its own running window, so the
+#     pin and the window show up as two separate items.
+#
+# WM_CLASS can only be set when the Tk interpreter's window is created, so
+# there is no post-hoc fix: aura.apply(root, ...) already runs too late. The
+# apps that do not use AuraApp create their root themselves, and there are 36
+# of them, so this is handled once here rather than 36 times downstream:
+# tk.Tk.__init__ is wrapped so a root created with the DEFAULT class picks up
+# this app's identity instead. An app that passes its own className is left
+# exactly as it is.
+#
+# The name must equal the desktop file's StartupWMClass= (ca/scripts/build-deb.sh
+# writes both from the same slug). Both halves are required — className alone
+# leaves the desktop entry unable to claim the window, and StartupWMClass alone
+# cannot work while every app answers to "Tk".
+
+def _wm_class_name():
+    """This app's stable identity: quickopen-<slug>."""
+    name = os.environ.get("QUICKOPEN_WM_CLASS")     # set by the shipped wrapper
+    if name:
+        return name
+    # /opt/quickopen/<slug>/<app>.py — the installed layout
+    try:
+        script = os.path.abspath(sys.argv[0] or "")
+        parts = script.replace("\\", "/").split("/")
+        if "quickopen" in parts:
+            i = parts.index("quickopen")
+            if i + 1 < len(parts) - 1 and parts[i + 1]:
+                return "quickopen-" + parts[i + 1]
+        stem = os.path.splitext(os.path.basename(script))[0]
+        if stem:
+            return "quickopen-" + stem.replace("_", "-").removesuffix("-app")
+    except Exception:
+        pass
+    return None
+
+
+_ORIG_TK_INIT = tk.Tk.__init__
+
+
+def _aura_tk_init(self, screenName=None, baseName=None, className="Tk",
+                  *args, **kwargs):
+    if className in (None, "Tk"):                   # i.e. not set by the app
+        wm = _wm_class_name()
+        if wm:
+            className = wm
+            if baseName is None:
+                baseName = wm                       # res_name; Plasma matches
+    return _ORIG_TK_INIT(self, screenName, baseName, className,
+                         *args, **kwargs)
+
+
+tk.Tk.__init__ = _aura_tk_init
+
+
+# =========================================================================
 # 5. apply() — theme the world (ctk theme + ttk styles + tk option db)
 # =========================================================================
 
