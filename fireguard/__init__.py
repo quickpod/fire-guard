@@ -44,7 +44,7 @@ from .ufw import (
     ufw_available,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 __all__ = [
     "FireGuardError",
